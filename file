@@ -1,0 +1,707 @@
+<#
+The code contained herein constitutes work product owned by TicketNetwork, Inc. and/or TicketSoftware, LLC.
+This code is a highly confidential, valuable trade secret, and shall not be disclosed or dispersed by anyone,
+including TicketNetwork and TicketSoftware employees, unless otherwise instructed by his/her manager.
+#>
+#add-pssnapin Microsoft.TeamFoundation.PowerShell
+try {
+
+$error.clear()
+
+Add-Type -AssemblyName System.Windows.Forms
+[System.Reflection.Assembly]::LoadWithPartialName("Microsoft.TeamFoundation.Client") | Out-Null
+[System.Reflection.Assembly]::LoadWithPartialName("Microsoft.TeamFoundation.VersionControl.Client") | Out-Null
+[System.Reflection.Assembly]::LoadWithPartialName("Microsoft.TeamFoundation.WorkItemTracking.Client") | Out-Null
+
+#[System.Reflection.Assembly]::LoadFrom("D:\Powershell\Assemblies\Microsoft.TeamFoundation.Client.dll") | Out-Null
+#[System.Reflection.Assembly]::LoadFrom("D:\Powershell\Assemblies\Microsoft.TeamFoundation.VersionControl.Client.dll") | Out-Null
+#[System.Reflection.Assembly]::LoadFrom("D:\Powershell\Assemblies\Microsoft.TeamFoundation.WorkItemTracking.Client.dll") | Out-Null
+#[System.Reflection.Assembly]::LoadFrom("D:\Powershell\Assemblies\Microsoft.TeamFoundation.Common.dll") | Out-Null
+
+$tfs_uri = "https://ticketnetwork.visualstudio.com"
+$tpc = New-Object Microsoft.TeamFoundation.Client.TfsTeamProjectCollection($tfs_uri);
+$vcs = $tpc.GetService([Microsoft.TeamFoundation.VersionControl.Client.VersionControlServer])
+$wis = $tpc.GetService([Microsoft.TeamFoundation.WorkItemTracking.Client.WorkItemStore])
+$folder_root = if ($PSScriptRoot) {$PSScriptRoot} else {"C:\Powershell"}
+$date = Get-Date -format 'MM_dd_yy HHmm'
+$temp_folder = "$folder_root\UI temp files $date" # temporary files stored here
+New-Item -Path "$temp_folder\Push Scripts" -ItemType directory -Force | Out-Null
+if (!(test-path "$folder_root\logs\UI Logs\UI log.txt")) {
+    New-Item "$folder_root\logs\UI Logs" -Force -ItemType Directory | Out-Null
+}
+$erroractionpreference = "SilentlyContinue"
+$git_pushscript_url = "https://ticketnetwork.visualstudio.com/DRM/_git/Deployment%20Scripts"
+cd "$temp_folder\Push Scripts"
+($retval = git clone $git_pushscript_url . 2>$null) | Out-Null
+if ($lastexitcode -and $retval) {throw $retval}
+$error.Clear()
+$erroractionpreference = "Stop"
+
+
+$pbi_list = @()
+$commit_list = @()
+
+$config_server = "TPDDEV1"
+$config_db = "script_gen_config"
+$conn_str = "Server=$config_server;Database=$config_db;trusted_connection=true;"
+$sql = "SELECT environment,svr FROM dbo.environment_server order by environment, svr;
+SELECT svr, db FROM dbo.server_db order by svr, db;
+SELECT environment, branch FROM dbo.environment_tfs_branch order by environment, branch
+"
+$ds = New-Object System.Data.DataSet
+$da = New-Object System.Data.SqlClient.SqlDataAdapter $sql, $conn_str
+[void]$da.Fill($ds)
+
+$env_servers = $ds.Tables[0]
+$environments = $env_servers.environment | Select-Object -Unique
+#$servers = $ds.Tables[1].svr | Select-Object -Unique
+$svr_dbs = $ds.tables[1]
+$env_branch = $ds.tables[2]
+
+$auto_complete = $true
+
+$form = New-Object System.Windows.Forms.Form
+$form.ClientSize = New-Object System.Drawing.Size(390, 408)
+$form.StartPosition = "CenterScreen"
+$form.Text = "Deployment Script Generator UI v2.0"
+$form.FormBorderStyle = 'Fixed3D'
+$form.BackColor = '#CCCCCC'
+$form.MaximizeBox = $false
+
+
+# parameters group box
+$parameter_group = New-Object System.Windows.Forms.GroupBox
+$parameter_group.Location = New-Object System.Drawing.Point(10,65)
+$parameter_group.Size = New-Object System.Drawing.Size(370,333)
+$parameter_group.Text = "Parameters:"
+$parameter_group.FlatStyle = 'Popup'
+$form.Controls.Add($parameter_group)
+
+# environment combo box
+$label_env = New-Object System.Windows.Forms.Label
+$label_env.Location = New-Object System.Drawing.Point(10,23)
+$label_env.Text = "Environment:"
+$parameter_group.Controls.Add($label_env)
+$combo_env = New-Object System.Windows.Forms.ComboBox
+$combo_env.Location = New-Object System.Drawing.Point(120,20)
+$combo_env.Size = New-Object System.Drawing.Size(240, 310)
+$combo_env.FlatStyle = 'Popup'
+foreach($environment in $environments)
+{
+  [void]$combo_env.Items.add($environment)
+}
+if ($auto_complete) {
+$combo_env.autoCompleteMode = 'Append'
+$combo_env.autoCompleteSource = 'ListItems'
+}
+$combo_env_SelectedIndexChanged =
+{
+    $selected_branch = $combo_env.Text
+    
+    $branch = $env_branch | ? {$_.environment -eq $selected_branch} | % {$_.branch}
+
+    if ($branch -eq "Production Releases") {$script_location = "$branch"}
+    else {$script_location = "Push Scripts/$branch"}
+
+    $combo_project.text = ''
+    $combo_sprint.text = ''
+    $combo_server.text = ''
+    $combo_project.Items.Clear()
+    $combo_sprint.Items.Clear()
+    $combo_server.Items.Clear()
+    #$list_database.ClearSelected()
+    #$list_database.Items.Clear()
+    $combo_database.text = ''
+    $combo_database.Items.Clear()
+    #$text_box_branch.Text = "DRM/_git"
+    
+    cd "$temp_folder\Push Scripts"
+    $push_folders = dir -Directory -Name
+    #$push_folders = $vcs.getitems("$/DRM/SQL Scripts/$script_location/*").items.serveritem
+    #$push_folders = $push_folders -replace "\$/DRM/SQL Scripts/$script_location/",""
+    
+    $push_folders | % {[void]$combo_project.Items.Add($_)}
+
+    $servers = $env_servers | ? {$_.environment -eq $selected_branch} | % {$_.svr}
+    $servers | % {[void]$combo_server.Items.Add($_)}
+    cd $folder_root
+}
+$combo_env.add_selectedIndexChanged($combo_env_SelectedIndexChanged)
+$parameter_group.Controls.Add($combo_env)
+
+
+
+# server combo box
+$label_server = New-Object System.Windows.Forms.Label
+$label_server.Location = New-Object System.Drawing.Point(10,53)
+$label_server.Text = "Server:"
+$parameter_group.Controls.Add($label_server)
+
+$combo_server = New-Object System.Windows.Forms.ComboBox
+$combo_server.Location = New-Object System.Drawing.Point(120, 50)
+$combo_server.Size = New-Object System.Drawing.Size(240, 310)
+$combo_server.FlatStyle = 'Popup'
+[void]$combo_server.Items.add("Select a target environment first!")
+
+
+$combo_server_SelectedIndexChanged =
+{
+    $databases = $svr_dbs | ? {$_.svr -eq $combo_server.text} | % {$_.db}
+    #$list_database.Items.Clear()
+    $combo_database.Items.Clear()
+    $combo_database.Text = ''
+    $databases | % {$combo_database.Items.Add($_)}
+    #foreach($database in $databases){[void]$list_database.Items.add($database)}
+    #$tfs_branch = $combo_server.Text -replace "TVD-","" -replace "TVD","" -replace "TQD-","" -replace "TQD","" -replace "APD-","" -replace "APD", ""
+    #if ($combo_env.Text -eq "QA") {
+    #    $version = "GBdevelopment"
+    #} else {
+    #    $version = "GBmaster"
+    #}
+    #$text_box_branch.Text = "DRM/_git/${tfs_branch}?version=$version"
+}
+
+
+$combo_server.add_selectedIndexChanged($combo_server_SelectedIndexChanged)
+if ($auto_complete) {
+$combo_server.autoCompleteMode = 'Append'
+$combo_server.autoCompleteSource = 'ListItems'
+}
+$parameter_group.Controls.Add($combo_server)
+
+
+# database list box
+$label_database = New-Object System.Windows.Forms.Label
+$label_database.Location = New-Object System.Drawing.Point(10,83)
+$label_database.Text = "Database:"
+$parameter_group.Controls.Add($label_database)
+
+$combo_database = New-Object System.Windows.Forms.ComboBox
+$combo_database.Location = New-Object System.Drawing.Point(120, 80)
+$combo_database.Size = New-Object System.Drawing.Size(240, 310)
+$combo_database.FlatStyle = 'Popup'
+[void]$combo_database.Items.add("Select a target server first!")
+
+if ($auto_complete) {
+$combo_database.autoCompleteMode = 'Append'
+$combo_database.autoCompleteSource = 'ListItems'
+}
+$parameter_group.Controls.Add($combo_database)
+
+#$combo_database_SelectedIndexChanged = 
+#{
+#    $tfs_branch = $combo_server.Text -replace "APD-","" -replace "APD","" -replace "TQD-","" -replace "TQD",""
+#    if ($combo_env.Text -eq "QA") {
+#        $version = "GBdevelopment"
+#    } else {
+#        $version = "GBmaster"
+#    }
+#    if ($tfs_branch -match "INV-01") {
+#        $text_box_branch.Text = "DRM/_git/$tfs_branch." + ($combo_database.Text -replace "^(.*)_\d*_(.*)$","`$1_x_`$2") + "?version=$version"
+#    } else {
+#        $text_box_branch.Text = "DRM/_git/$tfs_branch." + $combo_database.Text + "?version=$version"
+#    }
+#}
+#$combo_database.add_SelectedIndexChanged($combo_database_SelectedIndexChanged)
+
+# branch text box
+$label_branch = New-Object System.Windows.Forms.Label
+$label_branch.Location = New-Object System.Drawing.Point(10,105)
+$label_branch.Text = "Source control repository:"
+$label_branch.Size = New-Object System.Drawing.Size(110,40)
+$parameter_group.Controls.Add($label_branch)
+$combo_branch = New-Object System.Windows.Forms.ComboBox
+$combo_branch.Location = New-Object System.Drawing.Point(120,110)
+$combo_branch.Size = New-Object System.Drawing.Size(240, 20)
+$combo_branch.FlatStyle = 'Popup'
+[void]$combo_branch.Items.add("APP-01.App_ODS")
+[void]$combo_branch.Items.add("APP-01.bb_merge")
+[void]$combo_branch.Items.add("APP-02.app2")
+[void]$combo_branch.Items.add("APP-02.APP2_ODS")
+[void]$combo_branch.Items.add("APP-02.dbmail_archive")
+[void]$combo_branch.Items.add("APP-02.PrintingPressCMS")
+[void]$combo_branch.Items.add("CLR")
+[void]$combo_branch.Items.add("EXC1.ancillary_data")
+[void]$combo_branch.Items.add("EXC1.bb")
+[void]$combo_branch.Items.add("EXC1.build")
+[void]$combo_branch.Items.add("EXC1.DRM")
+[void]$combo_branch.Items.add("EXC1.inventory_setting")
+[void]$combo_branch.Items.add("EXC1.mergedb")
+[void]$combo_branch.Items.add("EXC1.order_processor")
+[void]$combo_branch.Items.add("EXC1.push_notification")
+[void]$combo_branch.Items.add("EXCSR-02.datanow_util")
+[void]$combo_branch.Items.add("INV-01.bapi_control")
+[void]$combo_branch.Items.add("INV-01.bid_x_inv")
+[void]$combo_branch.Items.add("INV-01.bid_x_rpt")
+[void]$combo_branch.Items.add("INV-01.exchange_repl")
+[void]$combo_branch.Items.add("LOG-01.tn_broker_api_log")
+[void]$combo_branch.Items.add("LOG-01.wslog")
+[void]$combo_branch.Items.add("MRC-01.mercury")
+[void]$combo_branch.Items.add("SHARED.app_util")
+[void]$combo_branch.Items.add("SSIS")
+[void]$combo_branch.Items.add("WEB-01.bb_web")
+[void]$combo_branch.Items.add("WEB-01.WEB_ODS")
+[void]$combo_branch.Items.add("WEBCATCTRL.steamroller_control")
+[void]$combo_branch.Items.add("WEBCATPRC.steamroller_pricing")
+[void]$combo_branch.Items.add("WEBCATxx.bb_flat")
+[void]$combo_branch.Items.add("WSO2-01.WSO2AM")
+$parameter_group.Controls.Add($combo_branch)
+
+<#
+$label_branch = New-Object System.Windows.Forms.Label
+$label_branch.Location = New-Object System.Drawing.Point(10,105)
+$label_branch.Text = "Source control repository:"
+$label_branch.Size = New-Object System.Drawing.Size(110,40)
+$parameter_group.Controls.Add($label_branch)
+$text_box_branch = New-Object System.Windows.Forms.TextBox
+$text_box_branch.Location = New-Object System.Drawing.Point(120,110)
+$text_box_branch.size = New-Object System.Drawing.Size(240,20)
+$text_box_branch.borderStyle = 'FixedSingle'
+$text_box_branch.Enabled = $false
+$text_box_branch.Text = "DRM/_git"
+$parameter_group.Controls.Add($text_box_branch)
+#>
+
+
+# project combo box
+$label_project = New-Object System.Windows.Forms.Label
+$label_project.Location = New-Object System.Drawing.Point(10,143)
+$label_project.Text = "Project:"
+$parameter_group.Controls.Add($label_project)
+
+$combo_project = New-Object System.Windows.Forms.ComboBox
+$combo_project.Location = New-Object System.Drawing.Point(120, 140)
+$combo_project.Size = New-Object System.Drawing.Size(240, 310)
+$combo_project.FlatStyle = 'Popup'
+[void]$combo_project.Items.Add("Select a target environment first!")
+
+$combo_project_SelectedIndexChanged =
+{
+    $combo_sprint.Text = ''
+    $combo_sprint.Items.Clear()
+    $selected_project = $combo_project.Text
+    cd "$temp_folder\Push Scripts\Production Releases\$selected_project"
+    $sprint_folders = dir -Directory -Name
+    $sprint_folders | % {[void]$combo_sprint.Items.Add($_)}
+
+    cd $folder_root
+    <#
+    $selected_env = $combo_env.Text
+    $selected_project = $combo_project.Text
+    $branch = $env_branch | ? {$_.environment -eq $selected_env} | % {$_.branch}
+
+    if ($branch -eq "Production Releases") {$script_location = "$branch/$selected_project"}
+    else {$script_location = "Push Scripts/$branch/$selected_project"}
+    
+    $combo_sprint.items.clear()
+    $combo_sprint.text = ''
+    #$sprints = $vcs.getitems("$/DRM/SQL Scripts/$script_location/*").items.serveritem
+    #$sprints = $sprints -replace "\$/DRM/SQL Scripts/$script_location/",""
+    #foreach ($sprint in $sprints)
+    #{
+    #      [void]$combo_sprint.Items.add($sprint)
+    #}
+    #>
+}
+
+$combo_project.add_selectedIndexChanged($combo_project_SelectedIndexChanged)
+if ($auto_complete) {
+$combo_project.autoCompleteMode = 'Append'
+$combo_project.autoCompleteSource = 'ListItems'
+}
+$parameter_group.Controls.Add($combo_project)
+
+
+
+
+# sprint combo box
+$label_sprint = New-Object System.Windows.Forms.Label
+$label_sprint.Location = New-Object System.Drawing.Point(10,173)
+$label_sprint.Text = "Sprint:"
+$parameter_group.Controls.Add($label_sprint)
+
+$combo_sprint = New-Object System.Windows.Forms.ComboBox
+$combo_sprint.Location = New-Object System.Drawing.Point(120,170)
+$combo_sprint.Size = New-Object System.Drawing.Size(240, 310)
+$combo_sprint.FlatStyle = 'Popup'
+[void]$combo_sprint.Items.Add("Select a target environment first!")
+if ($auto_complete) {
+    $combo_sprint.autoCompleteMode = 'Append'
+    $combo_sprint.autoCompleteSource = 'ListItems'
+}
+$parameter_group.Controls.Add($combo_sprint)
+
+
+
+# subfolder text box
+$label_subfolder = New-Object System.Windows.Forms.Label
+$label_subfolder.Location = New-Object System.Drawing.Point(10,203)
+$label_subfolder.Text = "Subfolder (Optional):"
+$label_subfolder.Size = New-Object System.Drawing.Size(110,20)
+$parameter_group.Controls.Add($label_subfolder)
+$text_box_subfolder = New-Object System.Windows.Forms.TextBox
+$text_box_subfolder.Location = New-Object System.Drawing.Point(120,200)
+$text_box_subfolder.size = New-Object System.Drawing.Size(240,20)
+$text_box_subfolder.borderStyle = 'FixedSingle'
+$parameter_group.Controls.Add($text_box_subfolder)
+
+
+
+# pbi list text box
+$label_pbi = New-Object System.Windows.Forms.Label
+$label_pbi.Location = New-Object System.Drawing.Point(10,233)
+$label_pbi.Text = "Work Item list:"
+$parameter_group.Controls.Add($label_pbi)
+$text_box_pbi = New-Object System.Windows.Forms.TextBox
+$text_box_pbi.Location = New-Object System.Drawing.Point(120,230)
+$text_box_pbi.size = New-Object System.Drawing.Size(240,20)
+$text_box_pbi.borderStyle = 'FixedSingle'
+$parameter_group.Controls.Add($text_box_pbi)
+
+
+
+# changeset list text box
+$label_commit = New-Object System.Windows.Forms.Label
+$label_commit.Location = New-Object System.Drawing.Point(10,263)
+$label_commit.Text = "Commit list:"
+$parameter_group.Controls.Add($label_commit)
+$text_box_commit = New-Object System.Windows.Forms.TextBox
+$text_box_commit.Location = New-Object System.Drawing.Point(120,260)
+$text_box_commit.size = New-Object System.Drawing.Size(240,20)
+$text_box_commit.borderStyle = 'FixedSingle'
+$parameter_group.Controls.Add($text_box_commit)
+
+
+
+# bypass code review check box
+$bypass_review_checkbox = New-Object System.Windows.Forms.CheckBox
+$bypass_review_checkbox.location = New-Object System.Drawing.Point(18,286)
+$bypass_review_checkbox.Size = New-Object System.Drawing.Size(150,20)
+$bypass_review_checkbox.flatStyle = 'Flat'
+$bypass_review_checkbox.Text = "Bypass code review"
+$bypass_review_checkbox.Enabled = $false
+$parameter_group.controls.Add($bypass_review_checkbox)
+
+# use AD check box
+$ad_checkbox = New-Object System.Windows.Forms.CheckBox
+$ad_checkbox.location = New-Object System.Drawing.Point(18,303)
+$ad_checkbox.Size = New-Object System.Drawing.Size(170,20)
+$ad_checkbox.flatStyle = 'Flat'
+$ad_checkbox.Text = "Use Windows Authentication"
+$parameter_group.controls.Add($ad_checkbox)
+
+
+## text logic
+function set_vars {
+$env = $combo_env.Text
+$target_server = $combo_server.Text
+if ($target_server -match "A[PS]D|BBX400") {$target_server += ".tn.local"}
+$database = $combo_database.Text
+$project = $combo_project.Text
+$sprint = $combo_sprint.Text
+if ($text_box_subfolder.text -ne '') {$subfolder = $('-subfolder ''' + $text_box_subfolder.Text + ''' ')}
+#if ($bypass_review_checkbox.Checked) {$bypass_code_review = '-bypass_code_review '}
+$bypass_code_review = '-bypass_code_review '
+if ($ad_checkbox.Checked) {$use_windows_auth = '-use_windows_auth '}
+if ($text_box_pbi.Text -match "[^0-9,]") {$text_box_pbi.Text = ""}
+if ($text_box_commit.Text -match "[^0-9A-Fa-f,']") {$text_box_commit.Text = ""}
+$branch = $combo_branch.Text
+
+$deploy_string = "& '$folder_root\generate deployment script - VSTS.ps1' " +
+'-target_server ''' + $target_server + ''' ' +
+'-target_db ''' + $database + ''' ' +
+'-project ''' + $project + ''' ' +
+'-sprint ''' + $sprint + ''' ' +
+$subfolder +
+'-pbi_list @(' + $text_box_pbi.Text + ') ' +
+'-commit_list @(' + $(if ($text_box_commit.text -ne "") {($text_box_commit.text -split "," | % {"'$_'"}) -join ","}) + ') ' +
+$bypass_code_review +
+$use_windows_auth + 
+'-branch ''' + $branch + ''' '
+
+$date = get-date -f o
+
+Add-Content "$folder_root\Logs\UI Logs\UI log.txt" -value $($date + ":" + $env:USERNAME + ":/$env;$target_server;$database;$project;$sprint;$($text_box_subfolder.Text);$($text_box_pbi.Text);$($text_box_commit.Text);$($bypass_review_checkbox.Checked);$($ad_checkbox.Checked);$($combo_branch.Text)/:"+ $deploy_string) -Force
+start powershell "& {$deploy_string}"
+
+
+}
+
+
+# load previous args button
+$logButton = New-Object System.Windows.Forms.Button
+$logButton.Location = New-Object System.Drawing.Size(10,10)
+$logButton.Size = New-Object System.Drawing.Size(170,25)
+$logButton.Text = "Load Recent"
+$logButton.Add_Click({set-args})
+$logButton.flatstyle = 'Flat'
+$form.Controls.Add($logButton)
+
+# clear button
+$clearButton = New-Object System.Windows.Forms.Button
+$clearButton.Location = New-Object System.Drawing.Size(10,35)
+$clearButton.Size = New-Object System.Drawing.Size(170,25)
+$clearButton.Text = "Clear"
+$clearButton.Add_Click({clear-args})
+$clearButton.flatstyle = 'Flat'
+$form.Controls.Add($clearButton)
+
+function set-args {
+    if (Test-Path "$folder_root\logs\UI Logs\UI log.txt") {
+        $arguments = @($(get-content "$folder_root\logs\UI Logs\UI log.txt" | ? {$_ -match "$env:USERNAME"}))[-1]
+        $arg_array = $($arguments -replace '^.*:/(.*)/:.*$','$1') -split ";"
+        $log_env = $arg_array[0]
+        $log_server = $arg_array[1]
+        $log_database = $arg_array[2]
+        $log_project = $arg_array[3]
+        $log_sprint = $arg_array[4]
+        $log_subfolder = $arg_array[5]
+        $log_pbi_list = $arg_array[6]
+        $log_commit_list = $arg_array[7]
+        #$log_bypass_review = $arg_array[8]
+        $log_use_windows_auth = $arg_array[9]
+        $log_branch = $arg_array[10]
+        
+        $combo_env.Text = $log_env
+        $combo_server.Text = $log_server -replace ".tn.local",""
+        #$log_database | % {$index = $list_database.Items.IndexOf($_); if ($index -ne -1) {$list_database.SetSelected($index,$true)} }
+        $combo_database.Text = $log_database
+        $combo_project.Text = $log_project
+        $combo_sprint.Text = $log_sprint
+        $text_box_subfolder.Text = $log_subfolder
+        $text_box_pbi.Text = $log_pbi_list
+        $text_box_commit.Text = $log_commit_list
+        #if ($log_bypass_review -eq "True") {$bypass_review_checkbox.Checked = $true}
+        #else {$bypass_review_checkbox.Checked = $false}
+        if ($log_use_windows_auth -eq "True") {$ad_checkbox.Checked = $true}
+        else {$ad_checkbox.Checked = $false}
+        #$tfs_branch = $combo_server.Text -replace "APD-","" -replace "APD","" -replace "TQD-","" -replace "TQD",""
+        #if ($tfs_branch -match "INV-01") {
+        #    $text_box_branch.Text = "DRM/_git/$tfs_branch." + $combo_database.Text -replace "^(.*)_\d*_(.*)$","`$1_x_`$2" + "?version=GBmaster"
+        #} else {
+        #    $text_box_branch.Text = "DRM/_git/$tfs_branch." + $combo_database.Text + "?version=GBmaster"
+        #}
+        $combo_branch.Text = $log_branch
+    }
+}
+
+function clear-args {
+    $combo_env.Text = ''
+    $combo_server.Text = ''
+    #$list_database.ClearSelected()
+    #$list_database.Items.Clear()
+    $combo_database.Text = ''
+    $combo_project.Text = ''
+    $combo_sprint.Text = ''
+    #$text_box_branch.Text = "DRM/_git"
+    $combo_branch.Text = ''
+    $text_box_subfolder.Text = ''
+    $text_box_pbi.Text = ''
+    $text_box_commit.Text = ''
+    #$bypass_review_checkbox.Checked = $false
+    $ad_checkbox.Checked = $false
+}
+
+# object scope button
+$scopeButton = New-Object System.Windows.Forms.Button
+$scopeButton.Location = New-Object System.Drawing.Size(180,10)
+$scopeButton.Size = New-Object System.Drawing.Size(200,25)
+$scopeButton.Text = "Check Object Scope"
+$scopeButton.Add_Click({check-scope})
+$scopeButton.flatstyle = 'Flat'
+$form.Controls.Add($scopeButton)
+$scopeButton.Enabled = $false
+
+#TODO
+function check-scope {
+    $form2 = New-Object System.Windows.Forms.Form
+    $form2.ClientSize = New-Object System.Drawing.Size(490, 280)
+    $form2.StartPosition = "Manual"
+    $form2.Location = New-Object System.Drawing.Point(900,400)
+    $form2.Text = "Object Scope"
+    $form2.FormBorderStyle = 'Fixed3D'
+    $form2.BackColor = '#CCCCCC'
+    $form2.MaximizeBox = $false
+    $form2.AutoSize = $true
+    $form2.AutoSizeMode = "GrowAndShrink"
+    
+    
+    $form2.Add_KeyDown({if ($_.KeyCode -eq "Enter") 
+        {$form2.Close()}})
+    $form2.Add_KeyDown({if ($_.KeyCode -eq "Escape") 
+        {$form2.Close()}})
+    
+    if ($text_box_pbi.Text -ne '' -and $text_box_commit.Text -ne $null) {
+    $text_box_pbi.Text.Split(",") | % {$pbi_list += $_}
+    }
+    if ($text_box_commit.Text -ne '' -and $text_box_commit.Text -ne $null) {
+    $text_box_commit.Text.Split(",") | % {$commit_list += $_}
+    }
+    
+    if ($pbi_list.Count -gt 0)
+    {
+        $artifacts = $pbi_list | % {$wis.GetWorkItem($_)} | % {$_.links} | ? {$_.GetType().Equals([Microsoft.TeamFoundation.WorkItemTracking.Client.ExternalLink])} | % {
+        $_.LinkedArtifactUri} | % {[Microsoft.TeamFoundation.LinkingUtilities]::decodeuri($_)}
+
+        $commit_list += $artifacts | % {$_.ToolSpecificID -match "^.*/.*/([0-9A-Fa-f]{40})$" | out-null; $matches[1]}
+    }
+
+    
+    $dt = New-Object System.Data.DataTable
+    [void]$dt.Columns.Add("Commit",[int])
+    [void]$dt.Columns.Add("Object",[string])
+    [void]$dt.Columns.Add("User",[string])
+    [void]$dt.Columns.Add("Date",[datetime])
+
+    #TODO
+    $scope = $commit_list | % {$cs = $_; $vcs.GetChangeset($_)} | % {
+    $owner = $_.Owner; $date = $_.CreationDate; $_.Changes | % {$_.Item.ServerItem} | ? {
+        $_ -match [regex]::Escape($text_box_branch.Text)} | % {$_ -replace ".*/(.*)\.sql","`$1"} | % {
+            $dt.Rows.Add($cs,$_,$owner,$date)
+        }
+    }
+    
+    
+    $scope_grid = New-Object System.Windows.Forms.DataGridView
+    $scope_grid.Size = New-Object System.Drawing.Size(680,270)
+    $scope_grid.Location = New-Object System.Drawing.Point(5,5)
+    $scope_grid.DataSource = $dt
+    $scope_grid.Name = "Object Scope"
+    $scope_grid.TabIndex = 0
+    $scope_grid.AutoSizeColumnsMode = "AllCells"
+    $scope_grid.AutoSizeRowsMode = "AllCells"
+    $form2.Controls.Add($scope_grid)
+
+    [void]$form2.ShowDialog()
+}
+
+$reviewButton = New-Object System.Windows.Forms.Button
+$reviewButton.Location = New-Object System.Drawing.Size(180,35)
+$reviewButton.Size = New-Object System.Drawing.Size(200,25)
+$reviewButton.Text = "Check Review Status"
+$reviewButton.Add_Click({check-review})
+$reviewButton.flatstyle = 'Flat'
+$reviewButton.Enabled = $false
+$form.Controls.Add($reviewButton)
+
+function check-review {
+    $form3 = New-Object System.Windows.Forms.Form
+    $form3.ClientSize = New-Object System.Drawing.Size(220, 280)
+    $form3.StartPosition = "Manual"
+    $form3.Location = New-Object System.Drawing.Point(900,400)
+    $form3.Text = "Object Scope"
+    $form3.FormBorderStyle = 'Fixed3D'
+    $form3.BackColor = '#CCCCCC'
+    $form3.MaximizeBox = $false
+    
+    $conn_str = "Server=$config_server;Database=$config_db;trusted_connection=true;"
+    $sql =  "SELECT changeset FROM dbo.accepted_changesets;
+    SELECT changeset FROM dbo.rejected_changesets;
+    SELECT changeset FROM dbo.pending_changesets"
+    
+    $ds = New-Object System.Data.DataSet
+    $da = New-Object System.Data.SqlClient.SqlDataAdapter $sql, $conn_str
+    [void]$da.Fill($ds)
+    
+    $accepted_changesets = $ds.Tables[0].changeset
+    $rejected_changesets = $ds.Tables[1].changeset
+    $pending_changesets = $ds.Tables[2].changeset
+    
+    if ($text_box_pbi.Text -ne '' -and $text_box_changeset.Text -ne $null) {
+    $text_box_pbi.Text.Split(",") | % {$pbi_list += $_}
+    }
+    if ($text_box_changeset.Text -ne '' -and $text_box_changeset.Text -ne $null) {
+    $text_box_changeset.Text.Split(",") | % {$changeset_list += $_}
+    }
+    
+    if ($pbi_list.Count -gt 0)
+    {
+        $changeset_list += $pbi_list | % {$wis.GetWorkItem($_)} | % {$_.links} | ? {$_.GetType().Equals([Microsoft.TeamFoundation.WorkItemTracking.Client.ExternalLink])} | % {
+        $_.LinkedArtifactUri} | % {[Microsoft.TeamFoundation.LinkingUtilities]::decodeuri($_)} | % {$_.ToolSpecificID}
+    }
+
+    $review_table_output = @()
+    $changeset_list | % {
+        if ($_ -in $accepted_changesets) {
+        $review_table_output += New-Object psobject -property @{State = "Accepted"; Changeset = $_}
+        } elseif ($_ -in $pending_changesets) {
+        $review_table_output += New-Object psobject -property @{State = "Pending"; Changeset = $_}
+        } elseif ($_ -in $rejected_changesets) {
+        $review_table_output += New-Object psobject -property @{State = "Rejected"; Changeset = $_}
+        } else {
+        $review_table_output += New-Object psobject -property @{State = "Not in Review"; Changeset = $_}
+        }
+    }
+    
+    
+    $review_grid = New-Object System.Windows.Forms.DataGridView
+    $review_grid.Size = New-Object System.Drawing.Size(210,270)
+    $review_grid.Location = New-Object System.Drawing.Point(5,5)
+    $array = New-Object System.Collections.ArrayList
+    if ($review_table_output.Count -eq 0) {
+    $review_table_output += New-Object psobject -property @{State = "No changesets selected."}
+    $array.Add($($review_table_output | select State))
+    }
+    elseif ($review_table_output.count -eq 1) {
+    $array.Add($($review_table_output | select Changeset, State))
+    }
+    else {
+    $array.AddRange($($review_table_output | select Changeset, State | Sort-Object -Property Changeset))
+    }
+    $review_grid.DataSource = $array
+    $review_grid.DataBindings.DefaultDataSourceUpdateMode = 0
+    $review_grid.Name = "Code Review"
+    $review_grid.DataMember = ""
+    $review_grid.TabIndex = 0
+    $review_grid.AutoSizeColumnsMode = "Fill"
+    
+    $form3.Controls.Add($review_grid)
+    #$form3.refresh()
+    
+    [void]$form3.ShowDialog()
+}
+
+
+
+
+
+# ok/cancel buttons
+$OKButton = New-Object System.Windows.Forms.Button
+$OKButton.Location = New-Object System.Drawing.Size(190,298)
+$OKButton.Size = New-Object System.Drawing.Size(85,25)
+$OKButton.Text = "OK"
+$OKButton.Add_Click({set_vars;$form.Close()})
+$OKButton.flatstyle = 'Flat'
+$parameter_group.Controls.Add($OKButton)
+
+$CancelButton = New-Object System.Windows.Forms.Button
+$CancelButton.Location = New-Object System.Drawing.Size(275,298)
+$CancelButton.Size = New-Object System.Drawing.Size(85,25)
+$CancelButton.Text = "Cancel"
+$CancelButton.Add_Click({$form.Close()})
+$CancelButton.flatstyle = 'Flat'
+$parameter_group.Controls.Add($CancelButton)
+
+
+$form.KeyPreview = $True
+#$form.Add_KeyDown({if ($_.KeyCode -eq "Enter") 
+#    {set_vars;$form.Close()}})
+$form.Add_KeyDown({if ($_.KeyCode -eq "Escape") 
+    {$form.Close()}})
+
+[void]$form.showdialog()
+
+}
+
+finally {
+if ($error.count -gt 0) 
+    {
+        for ($i = $error.count; $i -ge 0; $i--) 
+        {
+            $exc = $error[$i]
+            $host.ui.WriteErrorLine("$exc") *>&1
+        }
+    }
+#cd $folder_root
+Remove-Item $temp_folder -Recurse -Force
+}
